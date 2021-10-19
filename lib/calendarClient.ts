@@ -1,12 +1,15 @@
-import EventOrganizerMail from "./emails/EventOrganizerMail";
-import EventAttendeeMail from "./emails/EventAttendeeMail";
-import EventOrganizerRescheduledMail from "./emails/EventOrganizerRescheduledMail";
-import EventAttendeeRescheduledMail from "./emails/EventAttendeeRescheduledMail";
-import prisma from "./prisma";
 import { Credential } from "@prisma/client";
-import CalEventParser from "./CalEventParser";
+
 import { EventResult } from "@lib/events/EventManager";
 import logger from "@lib/logger";
+import { VideoCallData } from "@lib/videoClient";
+
+import CalEventParser from "./CalEventParser";
+import EventOrganizerMail from "./emails/EventOrganizerMail";
+import EventOrganizerRescheduledMail from "./emails/EventOrganizerRescheduledMail";
+import { AppleCalendar } from "./integrations/Apple/AppleCalendarAdapter";
+import { CalDavCalendar } from "./integrations/CalDav/CalDavCalendarAdapter";
+import prisma from "./prisma";
 
 const log = logger.getChildLogger({ prefix: ["[lib] calendarClient"] });
 
@@ -107,11 +110,7 @@ const o365Auth = (credential) => {
   };
 };
 
-interface Person {
-  name?: string;
-  email: string;
-  timeZone: string;
-}
+export type Person = { name: string; email: string; timeZone: string };
 
 export interface CalendarEvent {
   type: string;
@@ -119,6 +118,10 @@ export interface CalendarEvent {
   startTime: string;
   endTime: string;
   description?: string;
+  team?: {
+    name: string;
+    members: string[];
+  };
   location?: string;
   organizer: Person;
   attendees: Person[];
@@ -136,6 +139,7 @@ export interface IntegrationCalendar {
   name: string;
 }
 
+type BufferedBusyTime = { start: string; end: string };
 export interface CalendarApiAdapter {
   createEvent(event: CalendarEvent): Promise<unknown>;
 
@@ -143,7 +147,11 @@ export interface CalendarApiAdapter {
 
   deleteEvent(uid: string);
 
-  getAvailability(dateFrom, dateTo, selectedCalendars: IntegrationCalendar[]): Promise<unknown>;
+  getAvailability(
+    dateFrom: string,
+    dateTo: string,
+    selectedCalendars: IntegrationCalendar[]
+  ): Promise<BufferedBusyTime[]>;
 
   listCalendars(): Promise<IntegrationCalendar[]>;
 }
@@ -210,7 +218,9 @@ const MicrosoftOffice365Calendar = (credential): CalendarApiAdapter => {
 
   return {
     getAvailability: (dateFrom, dateTo, selectedCalendars) => {
-      const filter = "?startdatetime=" + dateFrom + "&enddatetime=" + dateTo;
+      const filter = `?startdatetime=${encodeURIComponent(dateFrom)}&enddatetime=${encodeURIComponent(
+        dateTo
+      )}`;
       return auth
         .getToken()
         .then((accessToken) => {
@@ -378,7 +388,7 @@ const GoogleCalendar = (credential): CalendarApiAdapter => {
             payload["location"] = event.location;
           }
 
-          if (event.conferenceData) {
+          if (event.conferenceData && event.location === "integrations:google:meet") {
             payload["conferenceData"] = event.conferenceData;
           }
 
@@ -507,8 +517,26 @@ const GoogleCalendar = (credential): CalendarApiAdapter => {
   };
 };
 
-// factory
-const calendars = (withCredentials): CalendarApiAdapter[] =>
+function getCalendarAdapterOrNull(credential: Credential): CalendarApiAdapter | null {
+  switch (credential.type) {
+    case "google_calendar":
+      return GoogleCalendar(credential);
+    case "office365_calendar":
+      return MicrosoftOffice365Calendar(credential);
+    case "caldav_calendar":
+      // FIXME types wrong & type casting should not be needed
+      return new CalDavCalendar(credential) as never as CalendarApiAdapter;
+    case "apple_calendar":
+      // FIXME types wrong & type casting should not be needed
+      return new AppleCalendar(credential) as never as CalendarApiAdapter;
+  }
+  return null;
+}
+
+/**
+ * @deprecated
+ */
+const calendars = (withCredentials: Credential[]): CalendarApiAdapter[] =>
   withCredentials
     .map((cred) => {
       switch (cred.type) {
@@ -516,11 +544,15 @@ const calendars = (withCredentials): CalendarApiAdapter[] =>
           return GoogleCalendar(cred);
         case "office365_calendar":
           return MicrosoftOffice365Calendar(cred);
+        case "caldav_calendar":
+          return new CalDavCalendar(cred);
+        case "apple_calendar":
+          return new AppleCalendar(cred);
         default:
           return; // unknown credential, could be legacy? In any case, ignore
       }
     })
-    .filter(Boolean);
+    .flatMap((item) => (item ? [item as CalendarApiAdapter] : []));
 
 const getBusyCalendarTimes = (withCredentials, dateFrom, dateTo, selectedCalendars) =>
   Promise.all(
@@ -529,18 +561,24 @@ const getBusyCalendarTimes = (withCredentials, dateFrom, dateTo, selectedCalenda
     return results.reduce((acc, availability) => acc.concat(availability), []);
   });
 
+/**
+ *
+ * @param withCredentials
+ * @deprecated
+ */
 const listCalendars = (withCredentials) =>
   Promise.all(calendars(withCredentials).map((c) => c.listCalendars())).then((results) =>
-    results.reduce((acc, calendars) => acc.concat(calendars), [])
+    results.reduce((acc, calendars) => acc.concat(calendars), []).filter((c) => c != null)
   );
 
 const createEvent = async (
   credential: Credential,
   calEvent: CalendarEvent,
   noMail = false,
-  maybeUid: string = null
+  maybeUid?: string,
+  optionalVideoCallData?: VideoCallData
 ): Promise<EventResult> => {
-  const parser: CalEventParser = new CalEventParser(calEvent, maybeUid);
+  const parser: CalEventParser = new CalEventParser(calEvent, maybeUid, optionalVideoCallData);
   const uid: string = parser.getUid();
   /*
    * Matching the credential type is a workaround because the office calendar simply strips away newlines (\n and \r).
@@ -571,24 +609,10 @@ const createEvent = async (
       entryPoints: maybeEntryPoints,
     });
 
-    const attendeeMail = new EventAttendeeMail(calEvent, uid, {
-      hangoutLink: maybeHangoutLink,
-      conferenceData: maybeConferenceData,
-      entryPoints: maybeEntryPoints,
-    });
-
     try {
       await organizerMail.sendEmail();
     } catch (e) {
       console.error("organizerMail.sendEmail failed", e);
-    }
-
-    if (!creationResult || !creationResult.disableConfirmationEmail) {
-      try {
-        await attendeeMail.sendEmail();
-      } catch (e) {
-        console.error("attendeeMail.sendEmail failed", e);
-      }
     }
   }
 
@@ -605,9 +629,10 @@ const updateEvent = async (
   credential: Credential,
   uidToUpdate: string,
   calEvent: CalendarEvent,
-  noMail = false
+  noMail = false,
+  optionalVideoCallData?: VideoCallData
 ): Promise<EventResult> => {
-  const parser: CalEventParser = new CalEventParser(calEvent);
+  const parser: CalEventParser = new CalEventParser(calEvent, undefined, optionalVideoCallData);
   const newUid: string = parser.getUid();
   const richEvent: CalendarEvent = parser.asRichEventPlain();
 
@@ -624,19 +649,10 @@ const updateEvent = async (
 
   if (!noMail) {
     const organizerMail = new EventOrganizerRescheduledMail(calEvent, newUid);
-    const attendeeMail = new EventAttendeeRescheduledMail(calEvent, newUid);
     try {
       await organizerMail.sendEmail();
     } catch (e) {
       console.error("organizerMail.sendEmail failed", e);
-    }
-
-    if (!updateResult || !updateResult.disableConfirmationEmail) {
-      try {
-        await attendeeMail.sendEmail();
-      } catch (e) {
-        console.error("attendeeMail.sendEmail failed", e);
-      }
     }
   }
 
@@ -657,4 +673,11 @@ const deleteEvent = (credential: Credential, uid: string): Promise<unknown> => {
   return Promise.resolve({});
 };
 
-export { getBusyCalendarTimes, createEvent, updateEvent, deleteEvent, listCalendars };
+export {
+  getBusyCalendarTimes,
+  createEvent,
+  updateEvent,
+  deleteEvent,
+  listCalendars,
+  getCalendarAdapterOrNull,
+};
